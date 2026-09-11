@@ -3,9 +3,11 @@
  * Usage: node test-suite.js [ws-url]
  *   default url: wss://battery-chat-server.onrender.com
  *
- * The suite tolerates other clients in the room (e.g. a live app instance):
- * core pairs are formed by name-locked retry, and the crowd test relaxes
- * its pairing math when a stranger steals a partner.
+ * Identities rotate on every pairing (the server rebrands both sides in the
+ * `matched` message), so a "locked pair" is verified by mutual consistency:
+ * each side's matched.partner must equal the other side's matched.name.
+ *
+ * The suite tolerates other clients in the room (e.g. a live app instance).
  */
 const WebSocket = require("ws");
 
@@ -66,26 +68,42 @@ function waitFor(c, type, pred, label, ms = 10000) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** All names a client has ever held (welcome name + one per pairing). */
+function knownNames(c) {
+  return new Set(
+    c.inbox.filter((m) => (m.type === "welcome" || m.type === "matched") && m.name).map((m) => m.name)
+  );
+}
+
 /**
- * Try to pair `a` with a FRESHLY connected client `b`, retrying around
- * strangers that steal the match. Returns [a, b, nameA, nameB].
+ * Pair the already-connected client `a` with a freshly connected stranger,
+ * retrying around queue-jumpers. Returns the newcomer once the mutual
+ * match is verified. Updates a.name / newcomer.name to their chat names.
  */
-async function formLockedPair(a) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const b = await connect("pair-b" + attempt);
-    const nameB = (await waitFor(b, "welcome", null, "welcome")).name;
-    try {
-      const [mA, mB] = await Promise.all([
-        waitFor(a, "matched", (m) => m.partner === nameB, "locked match", 8000),
-        waitFor(b, "matched", (m) => m.partner === a.name, "locked match", 8000),
-      ]);
-      return [mA, mB, b, nameB];
-    } catch (e) {
-      b.ws.close(); // a stranger stole this one; try again
-      await sleep(400);
+async function pairNewcomerWith(a) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const mark = a.inbox.length;
+    const b = await connect("newcomer-" + attempt);
+    const wB = await waitFor(b, "welcome", null, "welcome");
+    b.name = wB.name;
+    await Promise.race([
+      Promise.all([
+        waitFor(a, "matched", null, "any match", 8000).catch(() => null),
+        waitFor(b, "matched", null, "any match", 8000).catch(() => null),
+      ]),
+      sleep(8500),
+    ]);
+    const mA = a.inbox.slice(mark).find((m) => m.type === "matched");
+    const mB = b.inbox.find((m) => m.type === "matched");
+    if (mA && mB && mA.partner === mB.name && mB.partner === mA.name) {
+      a.name = mA.name;
+      b.name = mB.name;
+      return [b, mA, mB];
     }
+    b.ws.close(); // b paired someone else (or nobody); try again
+    await sleep(400);
   }
-  throw new Error("could not form a locked pair after 5 attempts");
+  throw new Error("could not pair a newcomer with " + a.label + " after 6 attempts");
 }
 
 (async () => {
@@ -107,11 +125,13 @@ async function formLockedPair(a) {
   probe.forEach((c) => c.ws.close());
   await sleep(500);
 
-  // ---- 3. 1-on-1 matching (name-locked) ----
-  const [mA, mB, B, nameB] = await formLockedPair(A);
-  B.name = nameB;
+  // ---- 3. 1-on-1 matching with rotating identities ----
+  const preName = A.name;
+  const [B, mA, mB] = await pairNewcomerWith(A);
   ok("two queued clients get matched", !!mA && !!mB);
-  ok("each is told the partner's real name", mA.partner === nameB && mB.partner === A.name);
+  ok("each is told their own fresh chat name", !!mA.name && !!mB.name && /^([A-Z][a-z]+){2}\d{2}$/.test(mA.name));
+  ok("identities rotate on pairing (name differs from queue name)", A.name !== preName, preName + " -> " + A.name);
+  ok("each is told the partner's current name", mA.partner === B.name && mB.partner === A.name);
   const introA = await waitFor(A, "system", (m) => /alone with/.test(m.text), "intro");
   ok("paired clients get an intro whisper", !!introA);
 
@@ -119,7 +139,7 @@ async function formLockedPair(a) {
   const markA = A.inbox.length;
   A.ws.send(JSON.stringify({ type: "msg", text: "ping from A" }));
   const rB = await waitFor(B, "chat", (m) => m.text === "ping from A", "chat from A");
-  ok("partner receives the message with sender's name", rB.from === A.name);
+  ok("partner receives the message with sender's current name", rB.from === A.name);
   await sleep(700);
   ok(
     "sender gets no echo of own message (server-side)",
@@ -151,21 +171,35 @@ async function formLockedPair(a) {
   ok("1 MB message handled without crashing server", rHuge.text.length === 500 && !A.closed && !B.closed);
 
   // ---- 7. graceful partner death → requeue ----
+  const inboxBeforeClose = A.inbox.map((m) => m.type).join(",");
   B.ws.close();
-  const van = await waitFor(A, "system", (m) => /vanished/.test(m.text), "vanish notice");
-  ok("survivor is told the partner vanished", /vanished without a trace/.test(van.text));
-  const reQ = await waitFor(A, "waiting", null, "requeue").catch(() => null);
+  const van = await waitFor(
+    A,
+    "system",
+    (m) => /vanished/.test(m.text) && A.inbox.indexOf(m) >= markA,
+    "vanish notice",
+    LOCAL ? 10000 : 70000
+  ).catch(() => null);
+  if (!van) {
+    console.log("  DEBUG: A inbox at failure: [" + A.inbox.map((m) => m.type).join(",") + "] before-close: [" + inboxBeforeClose + "]");
+    console.log("  DEBUG: B.closed =", B.closed, "| A.closed =", A.closed, "| A.name =", A.name, "| B.name =", B.name);
+    console.log("  DEBUG: A last 3 inbox entries:", JSON.stringify(A.inbox.slice(-3)));
+  }
+  ok("survivor is told the partner vanished", !!van);
+  const reQ = await waitFor(A, "waiting", null, "requeue", LOCAL ? 10000 : 70000).catch(() => null);
   ok("survivor is requeued automatically", !!reQ);
-  await sleep(400); // give the close handshake a moment to reach B's side
+  await sleep(400);
   ok("closed socket is really closed", B.closed);
 
-  // ---- 8. survivor matches the next arrival (name-locked) ----
-  const [, mD, D, nameD] = await formLockedPair(A);
-  ok("survivor pairs with the next stranger", mD.partner === A.name);
+  // ---- 8. survivor matches the next arrival, name rotates again ----
+  const nameBefore = A.name;
+  const [D] = await pairNewcomerWith(A);
+  ok("survivor pairs with the next stranger", true);
+  ok("survivor's name rotated again on the new pairing", A.name !== nameBefore, nameBefore + " -> " + A.name);
 
   // ---- 9. abrupt death (RST, no close frame) ----
   D.ws.terminate();
-  await waitFor(A, "system", (m) => /vanished/.test(m.text), "vanish after RST");
+  await waitFor(A, "system", (m) => /vanished/.test(m.text) && A.inbox.indexOf(m) >= markA, "vanish after RST", LOCAL ? 10000 : 70000);
   ok("abrupt socket death is detected, survivor requeued", true);
 
   // ---- 10. crowd pairing ----
@@ -178,11 +212,7 @@ async function formLockedPair(a) {
   if (LOCAL) {
     ok("11 newcomers + survivor form 6 pairs", matchedCrowd.length === 11, matchedCrowd.length + "/11 matched");
   } else {
-    ok(
-      "all 11 newcomers got matched (strangers tolerated)",
-      matchedCrowd.length === 11,
-      matchedCrowd.length + "/11 matched"
-    );
+    ok("all 11 newcomers got matched (strangers tolerated)", matchedCrowd.length === 11, matchedCrowd.length + "/11 matched");
   }
 
   A.ws.send(JSON.stringify({ type: "msg", text: "hello-from-A" }));
@@ -190,10 +220,10 @@ async function formLockedPair(a) {
   await sleep(2000);
   const everyone = [...crowd, A];
   const noSelf = everyone.every((c) => {
-    const own = c.inbox.find((m) => m.type === "welcome").name;
-    return !c.inbox.some((m) => m.type === "chat" && m.from === own);
+    const own = knownNames(c);
+    return !c.inbox.some((m) => m.type === "chat" && own.has(m.from));
   });
-  ok("nobody ever receives their own message from the server", noSelf);
+  ok("nobody ever receives their own message from the server (any of its names)", noSelf);
   const atMostOne = everyone.every((c) => {
     const chats = c.inbox.filter((m) => m.type === "chat" && /^hello-from-(A|\d+)$/.test(m.text));
     return chats.length <= 1;

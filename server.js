@@ -32,7 +32,7 @@ const NOUNS = [
 // Plain-HTTP front so Render's health checks (and browsers) can see the service is alive.
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
-  res.end("battery-chat server is running. connect via websocket.");
+  res.end("battery-chat server v2 — liveness-checked matchmaking, rotating identities.");
 });
 
 const wss = new WebSocketServer({ server });
@@ -91,11 +91,21 @@ async function matchmake(ws) {
   });
 }
 
+function rebrand(ws) {
+  usedNames.delete(ws.name);
+  ws.name = generateName();
+  usedNames.add(ws.name);
+}
+
 function pairUp(a, b) {
+  // Fresh identities for every conversation. Whoever you were while waiting
+  // dies here, and the name you chat under dies with the chat.
+  rebrand(a);
+  rebrand(b);
   a.partner = b;
   b.partner = a;
-  send(a, { type: "matched", partner: b.name });
-  send(b, { type: "matched", partner: a.name });
+  send(a, { type: "matched", name: a.name, partner: b.name });
+  send(b, { type: "matched", name: b.name, partner: a.name });
   send(a, {
     type: "system",
     text: `You're now alone with ${b.name}. Say hi before one of you dies.`,
