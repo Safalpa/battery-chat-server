@@ -57,18 +57,38 @@ function send(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function matchmake(ws) {
-  if (ws.partner) return; // already paired
-  if (waitingQueue.length > 0) {
-    const other = waitingQueue.shift();
-    pairUp(ws, other);
-  } else {
-    waitingQueue.push(ws);
-    send(ws, {
-      type: "waiting",
-      text: "Waiting for another dying stranger… (connecting)",
+const breathing = (ws) => ws.readyState === ws.OPEN;
+
+// Render's proxy can keep a departed client's socket looking open for
+// ~a minute. Before introducing two strangers, make sure the queued one
+// still has a living client behind it.
+function responds(ws, ms = 3000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    ws.once("pong", () => {
+      clearTimeout(timer);
+      resolve(true);
     });
+    ws.ping();
+  });
+}
+
+async function matchmake(ws) {
+  if (ws.partner || !breathing(ws)) return;
+  while (waitingQueue.length > 0) {
+    const other = waitingQueue.shift();
+    if (!breathing(other)) continue; // stale entry, try the next
+    if (await responds(other)) {
+      pairUp(ws, other);
+      return;
+    }
+    // No pong in time: the stranger was already gone. Loop.
   }
+  waitingQueue.push(ws);
+  send(ws, {
+    type: "waiting",
+    text: "Waiting for another dying stranger… (connecting)",
+  });
 }
 
 function pairUp(a, b) {
@@ -105,6 +125,10 @@ function handleLeave(ws) {
 }
 
 wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
   ws.name = generateName();
   ws.partner = null;
   usedNames.add(ws.name);
@@ -136,6 +160,18 @@ wss.on("connection", (ws) => {
   ws.on("close", () => handleLeave(ws));
   ws.on("error", () => ws.terminate());
 });
+
+// Heartbeat sweep: sockets that stop answering pings get terminated, so a
+// client that vanished without a word is dropped in ~15-30s instead of haunting
+// the queue until the proxy feels like mentioning it.
+const HEARTBEAT_MS = 15000;
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_MS);
 
 console.log(`battery-chat (1-on-1 matchmaking) running on ws://0.0.0.0:${PORT}`);
 console.log("No database. No logs. No mercy.");
