@@ -16,6 +16,9 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8123; // moved off 8080: something else squats on 8080 here
 const MAX_TEXT = 500;
+const AVOID_RECENT_CHANCE = 0.7; // odds of refusing to face the same stranger twice in a row
+const RECENT_PARTNER_TTL = 3 * 60 * 1000; // how long a face stays familiar (RAM only)
+const RETRY_MATCHMAKE_MS = 5000; // re-knock interval when avoidance stalls the queue
 
 const ADJECTIVES = [
   "Silent", "Fading", "Hollow", "Electric", "Midnight", "Dying", "Ghost",
@@ -32,7 +35,7 @@ const NOUNS = [
 // Plain-HTTP front so Render's health checks (and browsers) can see the service is alive.
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
-  res.end("battery-chat server v2 — liveness-checked matchmaking, rotating identities.");
+  res.end("battery-chat server v3 — liveness-checked matchmaking, rotating identities, walk-aways remembered.");
 });
 
 const wss = new WebSocketServer({ server });
@@ -59,6 +62,27 @@ function send(ws, obj) {
 
 const breathing = (ws) => ws.readyState === ws.OPEN;
 
+// A short RAM-only memory of who you just talked to, so the room can avoid
+// throwing you back together. It expires and is never written anywhere.
+function rememberPair(a, b) {
+  const now = Date.now();
+  for (const [x, y] of [[a, b], [b, a]]) {
+    if (!x.recent) x.recent = new Map();
+    x.recent.set(y, now);
+  }
+}
+
+function isRecentPartner(a, b) {
+  const t = a.recent && a.recent.get(b);
+  if (!t) return false;
+  if (Date.now() - t > RECENT_PARTNER_TTL) {
+    a.recent.delete(b);
+    if (b.recent) b.recent.delete(a);
+    return false;
+  }
+  return true;
+}
+
 // Render's proxy can keep a departed client's socket looking open for
 // ~a minute. Before introducing two strangers, make sure the queued one
 // still has a living client behind it.
@@ -75,20 +99,48 @@ function responds(ws, ms = 3000) {
 
 async function matchmake(ws) {
   if (ws.partner || !breathing(ws)) return;
-  while (waitingQueue.length > 0) {
-    const other = waitingQueue.shift();
-    if (!breathing(other)) continue; // stale entry, try the next
+  if (ws.retryTimer) {
+    clearTimeout(ws.retryTimer);
+    ws.retryTimer = null;
+  }
+  let i = 0;
+  while (i < waitingQueue.length) {
+    const other = waitingQueue[i];
+    if (other === ws) {
+      i++;
+      continue;
+    }
+    if (!breathing(other)) {
+      waitingQueue.splice(i, 1);
+      continue;
+    }
+    // 70% of the time, refuse to face the same stranger twice in a row.
+    if (isRecentPartner(ws, other) && Math.random() < AVOID_RECENT_CHANCE) {
+      i++;
+      continue;
+    }
+    waitingQueue.splice(i, 1);
     if (await responds(other)) {
       pairUp(ws, other);
       return;
     }
     // No pong in time: the stranger was already gone. Loop.
   }
-  waitingQueue.push(ws);
-  send(ws, {
-    type: "waiting",
-    text: "Waiting for another dying stranger… (connecting)",
-  });
+  const alreadyQueued = waitingQueue.includes(ws);
+  if (!alreadyQueued) {
+    waitingQueue.push(ws);
+    send(ws, {
+      type: "waiting",
+      text: "Waiting for another dying stranger… (connecting)",
+    });
+  }
+  // Two ex-partners alone in the queue can refuse each other into a
+  // deadlock — knock again every few seconds until the 30% happens or
+  // the memory of each other expires.
+  ws.retryTimer = setTimeout(() => {
+    ws.retryTimer = null;
+    if (!ws.partner && breathing(ws)) matchmake(ws);
+  }, RETRY_MATCHMAKE_MS);
 }
 
 function rebrand(ws) {
@@ -116,11 +168,28 @@ function pairUp(a, b) {
   });
 }
 
+// A voluntary walk-away. The partner can't tell leaving from dying —
+// that's the point.
+function breakUp(ws) {
+  const partner = ws.partner;
+  if (!partner) return;
+  rememberPair(ws, partner);
+  partner.partner = null;
+  ws.partner = null;
+  send(partner, {
+    type: "system",
+    text: `${ws.name} vanished without a trace. (battery died? plugged in?)`,
+  });
+  matchmake(partner);
+  matchmake(ws);
+}
+
 function handleLeave(ws) {
   usedNames.delete(ws.name); // name dies with the connection
 
   const partner = ws.partner;
   if (partner) {
+    rememberPair(ws, partner);
     partner.partner = null;
     send(partner, {
       type: "system",
@@ -157,6 +226,10 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      return;
+    }
+    if (msg.type === "leave") {
+      breakUp(ws);
       return;
     }
     if (msg.type === "msg" && typeof msg.text === "string" && ws.partner) {

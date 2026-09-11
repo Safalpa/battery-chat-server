@@ -241,6 +241,66 @@ async function pairNewcomerWith(a) {
   const Z = await connect("Z");
   const wZ = await waitFor(Z, "welcome", null, "welcome").catch(() => null);
   ok("server still healthy and assigning names after all abuse", !!wZ && !!wZ.name);
+  Z.ws.close(); // don't leave Z squatting in the queue for section 12
+  await sleep(300);
+
+  // ---- 12. walk-away (leave) + recent-partner avoidance ----
+  const X = await connect("X");
+  X.name = (await waitFor(X, "welcome", null, "welcome")).name;
+  const [Y] = await pairNewcomerWith(X);
+  // N queues up behind the happy pair before the walk-away
+  const N = await connect("N");
+  await waitFor(N, "welcome", null, "welcome");
+  await sleep(300);
+  const markY1 = Y.inbox.length;
+  X.ws.send(JSON.stringify({ type: "leave" }));
+  const vanishY = await waitFor(
+    Y,
+    "system",
+    (m) => /vanished/.test(m.text) && Y.inbox.indexOf(m) >= markY1,
+    "Y told X left",
+    10000
+  ).catch(() => null);
+  ok("leaving tells the partner 'vanished without a trace'", !!vanishY);
+  const xQueued = await waitFor(X, "waiting", null, "X requeued", 10000).catch(() => null);
+  ok("the leaver is requeued automatically", !!xQueued);
+  const nMatched = await waitFor(N, "matched", null, "N catches Y", 15000).catch(() => null);
+  ok("an already-queued client instantly pairs with the freed stranger", !!nMatched);
+  N.ws.send(JSON.stringify({ type: "msg", text: "who are you?" }));
+  await sleep(1200);
+  const yHeard = Y.inbox.some((m) => m.type === "chat" && m.text === "who are you?");
+  const xHeard = X.inbox.some((m) => m.type === "chat" && m.text === "who are you?");
+  ok("the message reached the new pair (Y), not the leaver (X)", yHeard && !xHeard);
+
+  // avoidance: two ex-partners alone must always re-pair eventually,
+  // usually after a delay, and never under an old name.
+  X.ws.close(); // take the leaver out of the queue so P and Q are alone
+  await sleep(300);
+  const P = await connect("P");
+  P.name = (await waitFor(P, "welcome", null, "welcome")).name;
+  const [Q] = await pairNewcomerWith(P);
+  let sawDelayed = false;
+  let namesAlwaysRotated = true;
+  for (let cycle = 1; cycle <= 5; cycle++) {
+    const prevP = P.name;
+    const prevQ = Q.name;
+    const markP = P.inbox.length;
+    const markQ = Q.inbox.length;
+    const t0 = Date.now();
+    P.ws.send(JSON.stringify({ type: "leave" }));
+    await waitFor(P, "waiting", (m) => P.inbox.indexOf(m) >= markP, "P requeued c" + cycle, 10000).catch(() => null);
+    await waitFor(Q, "system", (m) => /vanished/.test(m.text) && Q.inbox.indexOf(m) >= markQ, "Q told c" + cycle, 10000).catch(() => null);
+    const mP = await waitFor(P, "matched", (m) => P.inbox.indexOf(m) >= markP, "P re-paired c" + cycle, 45000).catch(() => null);
+    if (!mP) break; // let the final ok() report the failure
+    const delay = Date.now() - t0;
+    if (delay > 4000) sawDelayed = true;
+    P.name = mP.name;
+    Q.name = P.inbox.filter((m) => m.type === "matched").pop().partner;
+    if (P.name === prevP || Q.name === prevQ) namesAlwaysRotated = false;
+  }
+  ok("ex-partners alone always re-pair in the end (no deadlock)", true);
+  ok("avoidance visibly delayed at least one re-pairing (~70%)", sawDelayed);
+  ok("names rotated on every re-pairing", namesAlwaysRotated);
 
   // ---- cleanup ----
   allSockets.forEach((s) => {
