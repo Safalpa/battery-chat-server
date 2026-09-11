@@ -11,6 +11,7 @@
  *  - NOTHING is persisted. No sessions, no history, no logs.
  *  - Messages only travel between the two current partners.
  */
+const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8123; // moved off 8080: something else squats on 8080 here
@@ -28,7 +29,14 @@ const NOUNS = [
   "Charger", "Nurse", "Whisper", "Nectar", "Fossil", "Radio",
 ];
 
-const wss = new WebSocketServer({ port: PORT });
+// Plain-HTTP front so Render's health checks (and browsers) can see the service is alive.
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("battery-chat server is running. connect via websocket.");
+});
+
+const wss = new WebSocketServer({ server });
+server.listen(PORT);
 
 const usedNames = new Set();   // names in use right now (RAM only)
 const waitingQueue = [];      // sockets without a partner
