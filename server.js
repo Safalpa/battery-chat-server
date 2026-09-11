@@ -35,7 +35,7 @@ const NOUNS = [
 // Plain-HTTP front so Render's health checks (and browsers) can see the service is alive.
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
-  res.end("battery-chat server v3 — liveness-checked matchmaking, rotating identities, walk-aways remembered.");
+  res.end("battery-chat server v4 — secure windows, numbers buried on sight.");
 });
 
 const wss = new WebSocketServer({ server });
@@ -46,6 +46,15 @@ const waitingQueue = [];      // sockets without a partner
 
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// Numbers are how strangers stop being strangers. These get buried on sight.
+const PHONE_LIKE = /\+?\d(?:[\s\-().]*\d)+/g;
+
+function buryNumbers(text) {
+  return text.replace(PHONE_LIKE, (m) =>
+    m.replace(/\D/g, "").length >= 7 ? "[numbers die here too]" : m
+  );
 }
 
 function generateName() {
@@ -233,10 +242,17 @@ wss.on("connection", (ws) => {
       return;
     }
     if (msg.type === "msg" && typeof msg.text === "string" && ws.partner) {
-      const text = msg.text.trim().slice(0, MAX_TEXT);
+      const buried = buryNumbers(msg.text.trim());
+      const text = buried.slice(0, MAX_TEXT).trim();
       if (!text) return;
       // 1-on-1: only the current partner ever sees it. No storage anywhere.
       send(ws.partner, { type: "chat", from: ws.name, text });
+      if (buried !== msg.text.trim()) {
+        send(ws, {
+          type: "system",
+          text: "we buried the numbers in that one — nothing here lives long enough to dial",
+        });
+      }
     }
   });
 

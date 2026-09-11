@@ -302,6 +302,24 @@ async function pairNewcomerWith(a) {
   ok("avoidance visibly delayed at least one re-pairing (~70%)", sawDelayed);
   ok("names rotated on every re-pairing", namesAlwaysRotated);
 
+  // ---- 13. privacy: numbers get buried on sight ----
+  const markQ13 = Q.inbox.length;
+  const markP13 = P.inbox.length;
+  P.ws.send(JSON.stringify({ type: "msg", text: "call me at 98765 43210 or +91 9876500000" }));
+  await sleep(1500);
+  const qGot = Q.inbox.slice(markQ13).find((m) => m.type === "chat");
+  ok(
+    "phone numbers never reach the partner",
+    !!qGot && !qGot.text.includes("98765") && !qGot.text.includes("00000") && qGot.text.includes("numbers die here too"),
+    qGot && qGot.text
+  );
+  const pWhisper = P.inbox.slice(markP13).find((m) => m.type === "system" && /buried/.test(m.text));
+  ok("the sender is told the numbers were buried", !!pWhisper);
+  P.ws.send(JSON.stringify({ type: "msg", text: "hi 42" }));
+  await sleep(1200);
+  const qPlain = Q.inbox.slice(markQ13).find((m) => m.type === "chat" && m.text === "hi 42");
+  ok("small numbers pass untouched", !!qPlain);
+
   // ---- cleanup ----
   allSockets.forEach((s) => {
     try {
