@@ -1,0 +1,12 @@
+{
+  "name": "battery-chat-server",
+  "version": "1.0.0",
+  "description": "In-memory anonymous chat server. Nothing is ever saved.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
